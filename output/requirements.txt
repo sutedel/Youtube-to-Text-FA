@@ -1,0 +1,4 @@
+yt-dlp>=2023.12.30
+SpeechRecognition>=3.10.0
+pydub>=0.25.1
+PyAudio>=0.2.11

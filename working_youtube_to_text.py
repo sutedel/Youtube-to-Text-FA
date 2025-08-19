@@ -1,0 +1,296 @@
+import os
+import sys
+import re
+from urllib.parse import urlparse, parse_qs
+import speech_recognition as sr
+import yt_dlp
+import tempfile
+import json
+from text_normalizer import normalize_text, segment_sentences
+from pydub import AudioSegment
+
+class WorkingYouTubeToText:
+    def __init__(self):
+        self.recognizer = sr.Recognizer()
+        self.recognizer.energy_threshold = 300
+        self.recognizer.dynamic_energy_threshold = True
+        self.recognizer.pause_threshold = 0.8
+        self.output_dir = "output"
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+    def extract_video_id(self, url):
+        """Extract YouTube video ID from URL"""
+        parsed_url = urlparse(url)
+        if parsed_url.hostname in ('www.youtube.com', 'youtube.com'):
+            if parsed_url.path == '/watch':
+                return parse_qs(parsed_url.query)['v'][0]
+        elif parsed_url.hostname == 'youtu.be':
+            return parsed_url.path[1:]
+        return None
+    
+    def download_audio(self, url, output_path="audio"):
+        """Download audio from YouTube video"""
+        print("در حال دانلود فایل صوتی...")
+        
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': output_path,
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                downloaded_file = ydl.prepare_filename(info)
+                title = info.get('title') or "output"
+                print("دانلود فایل صوتی کامل شد!")
+                return downloaded_file, title
+        except Exception as e:
+            print(f"خطا در دانلود: {e}")
+            return None
+    
+    def transcribe_audio_file(self, audio_path):
+        """Transcribe audio file. For long audio, process in ~50s chunks to
+        avoid Google Web Speech length limits."""
+        print("در حال تبدیل گفتار به متن...")
+
+        try:
+            # Load and normalize audio (mono, 16 kHz)
+            segment = AudioSegment.from_file(audio_path)
+            segment = segment.set_channels(1).set_frame_rate(16000)
+
+            chunk_ms = 50_000  # 50 seconds per request (safe under ~60s limit)
+            texts = []
+            total_chunks = max(1, (len(segment) + chunk_ms - 1) // chunk_ms)
+
+            for idx in range(0, len(segment), chunk_ms):
+                part = segment[idx: idx + chunk_ms]
+
+                # Export temporary WAV for SpeechRecognition
+                tmp_wav = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tf:
+                        tmp_wav = tf.name
+                    part.export(tmp_wav, format='wav')
+
+                    with sr.AudioFile(tmp_wav) as source:
+                        # A small adjustment per chunk
+                        self.recognizer.adjust_for_ambient_noise(source, duration=0.2)
+                        audio_data = self.recognizer.record(source)
+
+                    # Try Persian first, then English
+                    try:
+                        text = self.recognizer.recognize_google(
+                            audio_data,
+                            language='fa-IR'
+                        )
+                        print("✅ متن فارسی تشخیص داده شد!")
+                    except sr.UnknownValueError:
+                        try:
+                            text = self.recognizer.recognize_google(
+                                audio_data,
+                                language='en-US'
+                            )
+                            print("✅ متن انگلیسی تشخیص داده شد!")
+                        except sr.UnknownValueError:
+                            text = ""
+                            print("❌ گفتار تشخیص داده نشد (بخشی از فایل)")
+                    texts.append(text)
+                finally:
+                    if tmp_wav and os.path.exists(tmp_wav):
+                        try:
+                            os.remove(tmp_wav)
+                        except:
+                            pass
+
+            full_text = " ".join(t for t in texts if t).strip()
+            if not full_text:
+                return "[گفتار تشخیص داده نشد - Speech not recognized]"
+            return full_text
+
+        except sr.RequestError as e:
+            print(f"❌ خطا در اتصال: {e}")
+            return f"[خطا در اتصال به سرویس تشخیص گفتار - {e}]"
+        except Exception as e:
+            print(f"خطا در پردازش فایل صوتی: {e}")
+            return f"[خطا در پردازش فایل صوتی - {e}]"
+    
+    def transcribe_video(self, url, output_file=None):
+        """Main function to transcribe YouTube video"""
+        print("شروع فرآیند تبدیل ویدیو به متن...")
+        
+        # Extract video ID and validate URL
+        video_id = self.extract_video_id(url)
+        if not video_id:
+            print("خطا: آدرس YouTube نامعتبر است")
+            return False
+        
+        print(f"شناسه ویدیو: {video_id}")
+        
+        # Download audio
+        audio_result = self.download_audio(url)
+        if not audio_result:
+            return False
+        audio_path, video_title = audio_result
+
+        # Ensure we have a WAV file for SpeechRecognition
+        wav_audio_path = self._ensure_wav(audio_path)
+
+        # Build output file base name from video title (max 20 chars)
+        base_name = self._make_safe_basename(video_title, fallback=video_id, max_length=20)
+        if not output_file:
+            output_file = os.path.join(self.output_dir, f"{base_name}.txt")
+        
+        # Transcribe audio
+        transcript_text = self.transcribe_audio_file(wav_audio_path)
+        normalized_text = normalize_text(transcript_text)
+        sentences = segment_sentences(normalized_text)
+        
+        # Save transcript to file
+        try:
+            # Write sentences to .txt (one per line); fallback to normalized text if empty
+            text_to_write = "\n".join(sentences) if sentences else normalized_text
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(text_to_write)
+            print(f"متن در فایل {output_file} ذخیره شد")
+            
+            # Also save as JSON for better structure
+            json_output = {
+                'video_id': video_id,
+                'url': url,
+                'title': video_title,
+                'transcript': normalized_text,
+                'method': 'Google Speech Recognition',
+                'sentences': sentences
+            }
+            
+            json_file = os.path.join(self.output_dir, f"{base_name}.json")
+            with open(json_file, 'w', encoding='utf-8') as f:
+                json.dump(json_output, f, ensure_ascii=False, indent=2)
+            print(f"اطلاعات کامل در فایل {json_file} ذخیره شد")
+            
+            return {
+                'text_file': output_file,
+                'json_file': json_file,
+                'title': video_title,
+                'video_id': video_id
+            }
+            
+        except Exception as e:
+            print(f"خطا در ذخیره فایل: {e}")
+            return False
+        
+        finally:
+            # Clean up audio file
+            if os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except:
+                    pass
+            if os.path.exists(wav_audio_path) and wav_audio_path != audio_path:
+                try:
+                    os.remove(wav_audio_path)
+                except:
+                    pass
+
+    def _make_safe_basename(self, title, fallback, max_length=20):
+        """Create a filesystem-safe basename from title, limited to max_length.
+        Falls back to provided fallback (e.g., video_id) if result is empty.
+        """
+        if not isinstance(title, str):
+            title = str(title or "")
+        # Remove illegal Windows filename chars and normalize whitespace
+        # Illegal: < > : " / \ | ? *
+        title = re.sub(r'[<>:"/\\|?*]', ' ', title)
+        title = re.sub(r'\s+', ' ', title).strip()
+        # Replace spaces with underscore for portability
+        safe = title.replace(' ', '_')
+        # Avoid trailing dots or spaces (Windows restriction)
+        safe = safe.rstrip(' .')
+        # Truncate to max_length
+        if len(safe) > max_length:
+            safe = safe[:max_length].rstrip('_')
+        if not safe:
+            safe = (fallback or "output")
+        # Final cleanup and ensure not empty
+        safe = re.sub(r'\s+', '_', safe).strip('_') or "output"
+        return safe
+
+    def _ensure_wav(self, input_path: str) -> str:
+        """Convert downloaded audio to WAV if needed. Returns path to WAV file.
+        Requires FFmpeg available in PATH for pydub to work.
+        """
+        try:
+            if input_path.lower().endswith('.wav'):
+                return input_path
+            output_path = os.path.splitext(input_path)[0] + '.wav'
+            audio = AudioSegment.from_file(input_path)
+            audio.export(output_path, format='wav')
+            return output_path
+        except Exception as e:
+            print(f"❌ تبدیل فایل صوتی به WAV ناموفق بود: {e}")
+            print("برای رفع مشکل، FFmpeg را نصب کنید و دوباره تلاش کنید.")
+            return input_path
+
+def main():
+    print("=" * 50)
+    print("برنامه تبدیل ویدیو YouTube به متن (کارآمد)")
+    print("Working YouTube Video to Text Converter")
+    print("=" * 50)
+    print()
+    print("📝 این برنامه:")
+    print("1. فایل صوتی ویدیو YouTube را دانلود می‌کند")
+    print("2. گفتار را به متن تبدیل می‌کند")
+    print("3. از زبان فارسی پشتیبانی می‌کند")
+    print("4. در صورت عدم تشخیص فارسی، انگلیسی را امتحان می‌کند")
+    print("5. برای تبدیل فرمت صوتی از FFmpeg استفاده می‌کند (به صورت خودکار)")
+    print()
+    print("⚠️  محدودیت‌ها:")
+    print("- فقط فرمت‌های صوتی پشتیبانی شده کار می‌کنند")
+    print("- کیفیت تشخیص به کیفیت صدا بستگی دارد")
+    print("- نیاز به اتصال اینترنت برای تشخیص گفتار دارد")
+    print()
+    
+    # Get YouTube URL from args or prompt
+    if len(sys.argv) > 1:
+        url = sys.argv[1].strip()
+        print(f"آدرس از خط فرمان دریافت شد: {url}")
+    else:
+        url = input("لطفاً آدرس ویدیو YouTube را وارد کنید: ").strip()
+    
+    if not url:
+        print("خطا: آدرس ویدیو وارد نشده است")
+        return
+    
+    # Create converter instance
+    converter = WorkingYouTubeToText()
+    
+    # Transcribe video
+    result = converter.transcribe_video(url)
+    
+    if result:
+        print("\n✅ فرآیند با موفقیت کامل شد!")
+        print("فایل‌های خروجی:")
+        if isinstance(result, dict):
+            print(f"- {result.get('text_file')}: متن ساده")
+            print(f"- {result.get('json_file')}: اطلاعات کامل")
+        else:
+            print("- transcript.txt: متن ساده")
+            print("- transcript.json: اطلاعات کامل")
+        print()
+        print("💡 نکات:")
+        print("- کیفیت تشخیص به کیفیت صدا بستگی دارد")
+        print("- برای ویدیوهای فارسی، بهترین نتیجه را خواهید گرفت")
+        print("- فایل‌های طولانی ممکن است زمان بیشتری نیاز داشته باشند")
+    else:
+        print("\n❌ خطا در فرآیند تبدیل")
+        print()
+        print("🔧 راه‌حل‌های ممکن:")
+        print("1. اتصال اینترنت خود را بررسی کنید")
+        print("2. آدرس YouTube را دوباره بررسی کنید")
+        print("3. ویدیو باید عمومی باشد (نه خصوصی)")
+
+if __name__ == "__main__":
+    main()
+
