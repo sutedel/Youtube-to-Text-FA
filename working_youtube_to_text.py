@@ -28,8 +28,8 @@ class WorkingYouTubeToText:
             return parsed_url.path[1:]
         return None
     
-    def download_audio(self, url, output_path="audio"):
-        """Download audio from YouTube video"""
+    def download_audio(self, url, output_path="audio", max_minutes: int | None = None):
+        """Download audio from YouTube video. If max_minutes is provided, only download that initial segment."""
         print("در حال دانلود فایل صوتی...")
         
         ydl_opts = {
@@ -38,6 +38,13 @@ class WorkingYouTubeToText:
             'quiet': True,
             'no_warnings': True,
         }
+
+        # Limit download duration for quick tests
+        if isinstance(max_minutes, int) and max_minutes > 0:
+            # yt-dlp supports section downloads
+            end_time = max_minutes * 60
+            ydl_opts['download_sections'] = {'*': [{'start_time': 0, 'end_time': end_time}]}
+            ydl_opts['force_keyframes_at_cuts'] = True
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -60,10 +67,11 @@ class WorkingYouTubeToText:
             segment = AudioSegment.from_file(audio_path)
             segment = segment.set_channels(1).set_frame_rate(16000)
 
-            chunk_ms = 50_000  # 50 seconds per request (safe under ~60s limit)
+            chunk_ms = 55_000  # slightly under 60s to reduce number of requests
             texts = []
             total_chunks = max(1, (len(segment) + chunk_ms - 1) // chunk_ms)
 
+            did_adjust = False
             for idx in range(0, len(segment), chunk_ms):
                 part = segment[idx: idx + chunk_ms]
 
@@ -75,8 +83,10 @@ class WorkingYouTubeToText:
                     part.export(tmp_wav, format='wav')
 
                     with sr.AudioFile(tmp_wav) as source:
-                        # A small adjustment per chunk
-                        self.recognizer.adjust_for_ambient_noise(source, duration=0.2)
+                        # Calibrate once for speed
+                        if not did_adjust:
+                            self.recognizer.adjust_for_ambient_noise(source, duration=0.0)
+                            did_adjust = True
                         audio_data = self.recognizer.record(source)
 
                     # Try Persian first, then English
@@ -104,6 +114,7 @@ class WorkingYouTubeToText:
                         except:
                             pass
 
+            # Join chunks simply; sentence segmentation will handle readability
             full_text = " ".join(t for t in texts if t).strip()
             if not full_text:
                 return "[گفتار تشخیص داده نشد - Speech not recognized]"
@@ -116,7 +127,7 @@ class WorkingYouTubeToText:
             print(f"خطا در پردازش فایل صوتی: {e}")
             return f"[خطا در پردازش فایل صوتی - {e}]"
     
-    def transcribe_video(self, url, output_file=None):
+    def transcribe_video(self, url, output_file=None, max_minutes: int | None = None):
         """Main function to transcribe YouTube video"""
         print("شروع فرآیند تبدیل ویدیو به متن...")
         
@@ -129,7 +140,7 @@ class WorkingYouTubeToText:
         print(f"شناسه ویدیو: {video_id}")
         
         # Download audio
-        audio_result = self.download_audio(url)
+        audio_result = self.download_audio(url, max_minutes=max_minutes)
         if not audio_result:
             return False
         audio_path, video_title = audio_result
@@ -252,11 +263,25 @@ def main():
     print("- نیاز به اتصال اینترنت برای تشخیص گفتار دارد")
     print()
     
-    # Get YouTube URL from args or prompt
-    if len(sys.argv) > 1:
-        url = sys.argv[1].strip()
+    # Get YouTube URL from args or prompt, with optional --max-minutes
+    max_minutes: int | None = None
+    args = sys.argv[1:]
+    url = None
+    # Very light parsing to avoid bringing in argparse overhead
+    if args:
+        # Support: working_youtube_to_text.py --max-minutes 5 <url>
+        if args[0] == '--max-minutes' and len(args) >= 3:
+            try:
+                max_minutes = int(args[1])
+            except ValueError:
+                max_minutes = None
+            url = args[2].strip()
+        else:
+            url = args[0].strip()
         print(f"آدرس از خط فرمان دریافت شد: {url}")
-    else:
+        if max_minutes:
+            print(f"فقط {max_minutes} دقیقه اول ویدیو پردازش خواهد شد (برای تست سریع)")
+    if not url:
         url = input("لطفاً آدرس ویدیو YouTube را وارد کنید: ").strip()
     
     if not url:
@@ -267,7 +292,7 @@ def main():
     converter = WorkingYouTubeToText()
     
     # Transcribe video
-    result = converter.transcribe_video(url)
+    result = converter.transcribe_video(url, max_minutes=max_minutes)
     
     if result:
         print("\n✅ فرآیند با موفقیت کامل شد!")
