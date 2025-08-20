@@ -7,7 +7,7 @@ import speech_recognition as sr
 import yt_dlp
 import tempfile
 import json
-from text_normalizer import normalize_text, segment_sentences
+from persian_text_normalizer import normalize_text, segment_sentences, PersianTextNormalizer
 from pydub import AudioSegment
 
 class WorkingYouTubeToText:

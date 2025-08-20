@@ -1,0 +1,5 @@
+yt-dlp>=2023.12.30
+SpeechRecognition>=3.10.0
+pydub>=0.25.1
+hazm>=0.7.0
+nltk>=3.8.1
