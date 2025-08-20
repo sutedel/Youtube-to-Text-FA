@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import time
 from urllib.parse import urlparse, parse_qs
 import speech_recognition as sr
 import yt_dlp
@@ -30,6 +31,7 @@ class WorkingYouTubeToText:
     
     def download_audio(self, url, output_path="audio", max_minutes: int | None = None):
         """Download audio from YouTube video. If max_minutes is provided, only download that initial segment."""
+        start_time = time.time()
         print("در حال دانلود فایل صوتی...")
         
         ydl_opts = {
@@ -51,8 +53,9 @@ class WorkingYouTubeToText:
                 info = ydl.extract_info(url, download=True)
                 downloaded_file = ydl.prepare_filename(info)
                 title = info.get('title') or "output"
-                print("دانلود فایل صوتی کامل شد!")
-                return downloaded_file, title
+                download_time = time.time() - start_time
+                print(f"دانلود فایل صوتی کامل شد! (زمان: {download_time:.1f} ثانیه)")
+                return downloaded_file, title, download_time
         except Exception as e:
             print(f"خطا در دانلود: {e}")
             return None
@@ -60,6 +63,7 @@ class WorkingYouTubeToText:
     def transcribe_audio_file(self, audio_path):
         """Transcribe audio file. For long audio, process in ~50s chunks to
         avoid Google Web Speech length limits."""
+        start_time = time.time()
         print("در حال تبدیل گفتار به متن...")
 
         try:
@@ -114,21 +118,24 @@ class WorkingYouTubeToText:
                         except:
                             pass
 
+            transcription_time = time.time() - start_time
+            print(f"تبدیل گفتار به متن کامل شد! (زمان: {transcription_time:.1f} ثانیه)")
             # Join chunks simply; sentence segmentation will handle readability
             full_text = " ".join(t for t in texts if t).strip()
             if not full_text:
-                return "[گفتار تشخیص داده نشد - Speech not recognized]"
-            return full_text
+                return "[گفتار تشخیص داده نشد - Speech not recognized]", transcription_time
+            return full_text, transcription_time
 
         except sr.RequestError as e:
             print(f"❌ خطا در اتصال: {e}")
-            return f"[خطا در اتصال به سرویس تشخیص گفتار - {e}]"
+            return f"[خطا در اتصال به سرویس تشخیص گفتار - {e}]", 0
         except Exception as e:
             print(f"خطا در پردازش فایل صوتی: {e}")
-            return f"[خطا در پردازش فایل صوتی - {e}]"
+            return f"[خطا در پردازش فایل صوتی - {e}]", 0
     
     def transcribe_video(self, url, output_file=None, max_minutes: int | None = None):
         """Main function to transcribe YouTube video"""
+        total_start_time = time.time()
         print("شروع فرآیند تبدیل ویدیو به متن...")
         
         # Extract video ID and validate URL
@@ -143,7 +150,7 @@ class WorkingYouTubeToText:
         audio_result = self.download_audio(url, max_minutes=max_minutes)
         if not audio_result:
             return False
-        audio_path, video_title = audio_result
+        audio_path, video_title, download_time = audio_result
 
         # Ensure we have a WAV file for SpeechRecognition
         wav_audio_path = self._ensure_wav(audio_path)
@@ -154,7 +161,12 @@ class WorkingYouTubeToText:
             output_file = os.path.join(self.output_dir, f"{base_name}.txt")
         
         # Transcribe audio
-        transcript_text = self.transcribe_audio_file(wav_audio_path)
+        transcript_result = self.transcribe_audio_file(wav_audio_path)
+        if isinstance(transcript_result, tuple):
+            transcript_text, transcription_time = transcript_result
+        else:
+            transcript_text = transcript_result
+            transcription_time = 0
         normalized_text = normalize_text(transcript_text)
         sentences = segment_sentences(normalized_text)
         
@@ -181,11 +193,17 @@ class WorkingYouTubeToText:
                 json.dump(json_output, f, ensure_ascii=False, indent=2)
             print(f"اطلاعات کامل در فایل {json_file} ذخیره شد")
             
+            total_time = time.time() - total_start_time
             return {
                 'text_file': output_file,
                 'json_file': json_file,
                 'title': video_title,
-                'video_id': video_id
+                'video_id': video_id,
+                'timing': {
+                    'download': download_time,
+                    'transcription': transcription_time,
+                    'total': total_time
+                }
             }
             
         except Exception as e:
@@ -263,6 +281,9 @@ def main():
     print("- نیاز به اتصال اینترنت برای تشخیص گفتار دارد")
     print()
     
+    # Start timer when URL is entered
+    overall_start_time = time.time()
+    
     # Get YouTube URL from args or prompt, with optional --max-minutes
     max_minutes: int | None = None
     args = sys.argv[1:]
@@ -294,22 +315,34 @@ def main():
     # Transcribe video
     result = converter.transcribe_video(url, max_minutes=max_minutes)
     
+    # Calculate total time from URL entry to file generation
+    total_overall_time = time.time() - overall_start_time
+    
     if result:
         print("\n✅ فرآیند با موفقیت کامل شد!")
-        print("فایل‌های خروجی:")
+        print(f"\n⏱️  کل زمان از ورود لینک تا تولید فایل: {total_overall_time:.1f} ثانیه")
+        print("\n📊 زمان‌بندی جزئی:")
+        if isinstance(result, dict) and 'timing' in result:
+            timing = result['timing']
+            print(f"  📥 دانلود: {timing['download']:.1f} ثانیه")
+            print(f"  🎤 تبدیل گفتار: {timing['transcription']:.1f} ثانیه")
+            print(f"  ⚙️  پردازش داخلی: {timing['total'] - timing['download'] - timing['transcription']:.1f} ثانیه")
+        print("\n📄 فایل‌های خروجی:")
         if isinstance(result, dict):
             print(f"- {result.get('text_file')}: متن ساده")
             print(f"- {result.get('json_file')}: اطلاعات کامل")
         else:
             print("- transcript.txt: متن ساده")
             print("- transcript.json: اطلاعات کامل")
-        print()
-        print("💡 نکات:")
+        print("\n💡 نکات:")
         print("- کیفیت تشخیص به کیفیت صدا بستگی دارد")
         print("- برای ویدیوهای فارسی، بهترین نتیجه را خواهید گرفت")
         print("- فایل‌های طولانی ممکن است زمان بیشتری نیاز داشته باشند")
+        print("- زمان دانلود به سرعت اینترنت بستگی دارد")
+        print("- زمان تبدیل گفتار به تعداد قطعات صوتی بستگی دارد")
     else:
         print("\n❌ خطا در فرآیند تبدیل")
+        print(f"⏱️  زمان صرف شده: {total_overall_time:.1f} ثانیه")
         print()
         print("🔧 راه‌حل‌های ممکن:")
         print("1. اتصال اینترنت خود را بررسی کنید")
