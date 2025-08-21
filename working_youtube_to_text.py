@@ -169,11 +169,18 @@ class WorkingYouTubeToText:
             transcription_time = 0
         normalized_text = normalize_text(transcript_text)
         sentences = segment_sentences(normalized_text)
+
+        # Determine if meaningful text was produced (avoid deleting audio if not)
+        text_produced = isinstance(transcript_text, str) and not transcript_text.strip().startswith('[')
+
+        # Remove commas per user preference (both Persian and Latin)
+        clean_normalized_text = normalized_text.replace('،', '').replace(',', '')
+        clean_sentences = [s.replace('،', '').replace(',', '') for s in sentences]
         
         # Save transcript to file
         try:
             # Write sentences to .txt (one per line); fallback to normalized text if empty
-            text_to_write = "\n".join(sentences) if sentences else normalized_text
+            text_to_write = "\n".join(clean_sentences) if clean_sentences else clean_normalized_text
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(text_to_write)
             print(f"متن در فایل {output_file} ذخیره شد")
@@ -183,9 +190,9 @@ class WorkingYouTubeToText:
                 'video_id': video_id,
                 'url': url,
                 'title': video_title,
-                'transcript': normalized_text,
+                'transcript': clean_normalized_text,
                 'method': 'Google Speech Recognition',
-                'sentences': sentences
+                'sentences': clean_sentences
             }
             
             json_file = os.path.join(self.output_dir, f"{base_name}.json")
@@ -194,7 +201,7 @@ class WorkingYouTubeToText:
             print(f"اطلاعات کامل در فایل {json_file} ذخیره شد")
             
             total_time = time.time() - total_start_time
-            return {
+            result_payload = {
                 'text_file': output_file,
                 'json_file': json_file,
                 'title': video_title,
@@ -205,23 +212,33 @@ class WorkingYouTubeToText:
                     'total': total_time
                 }
             }
+            # Mark for deletion only if text was actually produced
+            should_delete_audio = True if text_produced else False
+            return result_payload
             
         except Exception as e:
             print(f"خطا در ذخیره فایل: {e}")
             return False
         
         finally:
-            # Clean up audio file
-            if os.path.exists(audio_path):
-                try:
-                    os.remove(audio_path)
-                except:
-                    pass
-            if os.path.exists(wav_audio_path) and wav_audio_path != audio_path:
-                try:
-                    os.remove(wav_audio_path)
-                except:
-                    pass
+            # Clean up audio files only if meaningful text was produced
+            try:
+                should_delete = locals().get('should_delete_audio', False)
+                if should_delete:
+                    if os.path.exists(audio_path):
+                        try:
+                            os.remove(audio_path)
+                        except:
+                            pass
+                    if os.path.exists(wav_audio_path) and wav_audio_path != audio_path:
+                        try:
+                            os.remove(wav_audio_path)
+                        except:
+                            pass
+                else:
+                    print("ℹ️ فایل‌های صوتی برای بررسی نگه داشته شدند (عدم تولید متن).")
+            except Exception:
+                pass
 
     def _make_safe_basename(self, title, fallback, max_length=20):
         """Create a filesystem-safe basename from title, limited to max_length.
