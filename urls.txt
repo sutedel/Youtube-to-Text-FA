@@ -1,0 +1,9 @@
+# لینک‌های یوتیوب را اینجا بگذارید — هر لینک در یک خط.
+# خط‌هایی که با # شروع شوند یا خالی باشند نادیده گرفته می‌شوند.
+# می‌توانید لینک پلی‌لیست کامل را هم بگذارید؛ خودکار به همه‌ی ویدیوها باز می‌شود.
+#
+# نمونه:
+# https://youtu.be/mf2ryR6DfxE
+# https://www.youtube.com/playlist?list=XXXXXXXXXXXX
+
+https://www.youtube.com/playlist?list=PL-f5tVdZrkVzR93d8BnMYFWOJzyr0sZsb

@@ -8,6 +8,7 @@ import yt_dlp
 import tempfile
 import json
 from persian_text_normalizer import normalize_text, segment_sentences, PersianTextNormalizer
+from persian_domain_corrector import correct_text, WHISPER_INITIAL_PROMPT, WHISPER_HOTWORDS
 from pydub import AudioSegment
 
 class WorkingYouTubeToText:
@@ -18,6 +19,17 @@ class WorkingYouTubeToText:
         self.recognizer.pause_threshold = 0.8
         self.output_dir = "output"
         os.makedirs(self.output_dir, exist_ok=True)
+
+        # --- Speech-to-text engine configuration ---------------------------------
+        # Primary engine is faster-whisper (much better for accented/colloquial
+        # Persian). It falls back to Google Web Speech automatically if the package
+        # or model can't be loaded. Override via environment variables if needed.
+        self.whisper_model_size = os.getenv("WHISPER_MODEL", "large-v3")
+        self.whisper_device = os.getenv("WHISPER_DEVICE", "auto")  # "cpu" | "cuda" | "auto"
+        # int8 on CPU keeps memory/time reasonable; float16 is faster on GPU.
+        self.whisper_compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "")
+        self._use_whisper = os.getenv("USE_WHISPER", "1") != "0"
+        self._whisper_model = None  # lazy-loaded on first use
         
     def extract_video_id(self, url):
         """Extract YouTube video ID from URL"""
@@ -33,12 +45,16 @@ class WorkingYouTubeToText:
         """Download audio from YouTube video. If max_minutes is provided, only download that initial segment."""
         start_time = time.time()
         print("در حال دانلود فایل صوتی...")
+
+        # Use absolute path inside output dir to avoid Windows fragment path issues
+        abs_output_path = os.path.join(os.path.abspath(self.output_dir), "audio_download")
         
         ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': output_path,
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
+            'outtmpl': abs_output_path,
             'quiet': True,
             'no_warnings': True,
+            'nopart': True,
         }
 
         # Limit download duration for quick tests
@@ -60,16 +76,115 @@ class WorkingYouTubeToText:
             print(f"خطا در دانلود: {e}")
             return None
     
+    def _resolve_compute_type(self, device: str) -> str:
+        """Pick a sensible compute type when the user hasn't forced one."""
+        if self.whisper_compute_type:
+            return self.whisper_compute_type
+        return "float16" if device == "cuda" else "int8"
+
+    def _load_whisper(self):
+        """Lazy-load the faster-whisper model. Returns the model or None if
+        unavailable (caller then falls back to Google)."""
+        if not self._use_whisper:
+            return None
+        if self._whisper_model is not None:
+            return self._whisper_model
+        try:
+            from faster_whisper import WhisperModel
+            device = self.whisper_device
+            if device == "auto":
+                # Detect an NVIDIA GPU through CTranslate2 itself (no torch needed).
+                try:
+                    import ctranslate2
+                    device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+                except Exception:
+                    device = "cpu"
+                if device == "cpu":
+                    print(
+                        "ℹ️  GPU یافت نشد؛ Whisper روی CPU اجرا می‌شود (برای ویدیوهای بلند کند است). "
+                        "برای سرعت بالا روی سیستم دارای GPU انویدیا اجرا کنید یا WHISPER_MODEL را کوچک‌تر کنید."
+                    )
+            compute_type = self._resolve_compute_type(device)
+            print(
+                f"در حال بارگذاری مدل Whisper ({self.whisper_model_size}) "
+                f"روی {device} / {compute_type}..."
+            )
+            self._whisper_model = WhisperModel(
+                self.whisper_model_size,
+                device=device,
+                compute_type=compute_type,
+            )
+            print("✅ مدل Whisper بارگذاری شد")
+        except Exception as e:
+            print(f"⚠️  بارگذاری Whisper ناموفق بود ({e}). به Google برمی‌گردیم.")
+            self._use_whisper = False
+            self._whisper_model = None
+        return self._whisper_model
+
     def transcribe_audio_file(self, audio_path):
-        """Transcribe audio file. For long audio, process in ~50s chunks to
-        avoid Google Web Speech length limits."""
+        """Transcribe an audio file. Uses faster-whisper when available (best
+        quality for accented Persian), otherwise falls back to Google."""
+        model = self._load_whisper()
+        if model is not None:
+            result = self._transcribe_with_whisper(model, audio_path)
+            if result is not None:
+                return result
+        return self._transcribe_with_google(audio_path)
+
+    def _transcribe_with_whisper(self, model, audio_path):
+        """Transcribe with faster-whisper. Whisper handles long audio and its own
+        VAD segmentation, and `initial_prompt` primes the domain vocabulary so
+        accented terms (تیرکس، کندل، اف تی سی ...) are spelled correctly.
+        Returns (text, seconds) or None to trigger the Google fallback."""
         start_time = time.time()
-        print("در حال تبدیل گفتار به متن...")
+        print("در حال تبدیل گفتار به متن با Whisper...")
+        try:
+            segments, _info = model.transcribe(
+                audio_path,
+                language="fa",
+                task="transcribe",
+                initial_prompt=WHISPER_INITIAL_PROMPT,
+                hotwords=WHISPER_HOTWORDS,
+                beam_size=5,
+                temperature=0.0,
+                # False so hotwords bias EVERY window (not just the first) and to
+                # avoid error/repetition propagation on long Persian lectures.
+                condition_on_previous_text=False,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+            )
+            parts = []
+            for seg in segments:
+                t = (seg.text or "").strip()
+                if t:
+                    parts.append(t)
+            full_text = " ".join(parts).strip()
+            transcription_time = time.time() - start_time
+            print(
+                f"تبدیل گفتار به متن کامل شد! (Whisper، زمان: {transcription_time:.1f} ثانیه)"
+            )
+            if not full_text:
+                return "[گفتار تشخیص داده نشد - Speech not recognized]", transcription_time
+            return full_text, transcription_time
+        except Exception as e:
+            print(f"❌ خطا در Whisper ({e}). تلاش با Google...")
+            return None
+
+    def _transcribe_with_google(self, audio_path):
+        """Transcribe with Google Web Speech in ~55s chunks (fallback engine)."""
+        start_time = time.time()
+        print("در حال تبدیل گفتار به متن (Google)...")
 
         try:
-            # Load and normalize audio (mono, 16 kHz)
+            # Load and clean audio (mono, 16 kHz, high-pass + loudness normalize)
             segment = AudioSegment.from_file(audio_path)
             segment = segment.set_channels(1).set_frame_rate(16000)
+            try:
+                from pydub.effects import normalize as _normalize
+                segment = segment.high_pass_filter(80)  # drop low-frequency rumble
+                segment = _normalize(segment)           # even out loudness
+            except Exception as _e:
+                print(f"⚠️  بهبود صدا انجام نشد: {_e}")
 
             chunk_ms = 55_000  # slightly under 60s to reduce number of requests
             texts = []
@@ -87,9 +202,9 @@ class WorkingYouTubeToText:
                     part.export(tmp_wav, format='wav')
 
                     with sr.AudioFile(tmp_wav) as source:
-                        # Calibrate once for speed
+                        # Calibrate ambient noise once on a short window
                         if not did_adjust:
-                            self.recognizer.adjust_for_ambient_noise(source, duration=0.0)
+                            self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
                             did_adjust = True
                         audio_data = self.recognizer.record(source)
 
@@ -155,6 +270,11 @@ class WorkingYouTubeToText:
         # Ensure we have a WAV file for SpeechRecognition
         wav_audio_path = self._ensure_wav(audio_path)
 
+        # Reliably trim to the first max_minutes (the yt-dlp section download is
+        # not honored for audio-only formats, so we cut the WAV ourselves).
+        if isinstance(max_minutes, int) and max_minutes > 0:
+            wav_audio_path = self._trim_wav(wav_audio_path, max_minutes)
+
         # Build output file base name from video title (max 20 chars)
         base_name = self._make_safe_basename(video_title, fallback=video_id, max_length=20)
         if not output_file:
@@ -167,11 +287,22 @@ class WorkingYouTubeToText:
         else:
             transcript_text = transcript_result
             transcription_time = 0
+        # Determine if meaningful text was produced (avoid deleting audio if not)
+        text_produced = isinstance(transcript_text, str) and not transcript_text.strip().startswith('[')
+
+        # Fix domain jargon mis-heard from accent/colloquial speech BEFORE
+        # normalization (e.g. تیکس→تیرکس، ftc→اف تی سی، ASCII→Persian digits).
+        if text_produced:
+            transcript_text = correct_text(transcript_text)
+
         normalized_text = normalize_text(transcript_text)
         sentences = segment_sentences(normalized_text)
 
-        # Determine if meaningful text was produced (avoid deleting audio if not)
-        text_produced = isinstance(transcript_text, str) and not transcript_text.strip().startswith('[')
+        # Re-apply domain corrections AFTER normalization so the (basic) normalizer
+        # can't undo them (e.g. mapping «ئ»→«ی»). correct_text is idempotent.
+        if text_produced:
+            normalized_text = correct_text(normalized_text)
+            sentences = [correct_text(s) for s in sentences]
 
         # Remove commas per user preference (both Persian and Latin)
         clean_normalized_text = normalized_text.replace('،', '').replace(',', '')
@@ -262,6 +393,23 @@ class WorkingYouTubeToText:
         # Final cleanup and ensure not empty
         safe = re.sub(r'\s+', '_', safe).strip('_') or "output"
         return safe
+
+    def _trim_wav(self, wav_path: str, max_minutes: int) -> str:
+        """Write a trimmed copy containing only the first max_minutes. Returns the
+        trimmed path, or the original path if trimming fails."""
+        try:
+            audio = AudioSegment.from_file(wav_path)
+            limit_ms = max_minutes * 60 * 1000
+            if len(audio) <= limit_ms:
+                return wav_path
+            trimmed = audio[:limit_ms]
+            out_path = os.path.splitext(wav_path)[0] + f"_first{max_minutes}m.wav"
+            trimmed.export(out_path, format="wav")
+            print(f"✂️  صدا به {max_minutes} دقیقه‌ی اول بریده شد (برای تست).")
+            return out_path
+        except Exception as e:
+            print(f"⚠️  بریدن صدا ناموفق بود: {e}")
+            return wav_path
 
     def _ensure_wav(self, input_path: str) -> str:
         """Convert downloaded audio to WAV if needed. Returns path to WAV file.

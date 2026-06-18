@@ -1,5 +1,8 @@
-yt-dlp>=2023.12.30
+yt-dlp>=2026.6.9
 SpeechRecognition>=3.10.0
 pydub>=0.25.1
 hazm>=0.7.0
 nltk>=3.8.1
+# Primary speech-to-text engine (best accuracy for accented/colloquial Persian).
+# CPU-only by design (CTranslate2); no PyTorch required.
+faster-whisper>=1.0.0
