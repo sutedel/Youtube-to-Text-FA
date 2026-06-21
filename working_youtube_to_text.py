@@ -2,6 +2,23 @@ import os
 import sys
 import re
 import time
+import glob
+
+if os.name == "nt":
+    _winget_links = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Links"
+    )
+    if os.path.isdir(_winget_links) and _winget_links not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _winget_links + os.pathsep + os.environ.get("PATH", "")
+    # Persian text + emoji status messages crash print() on consoles still using
+    # the legacy cp1252/cp1257 codepage. Force UTF-8 so a print never kills the run.
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
 from urllib.parse import urlparse, parse_qs
 import speech_recognition as sr
 import yt_dlp
@@ -30,6 +47,33 @@ class WorkingYouTubeToText:
         self.whisper_compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "")
         self._use_whisper = os.getenv("USE_WHISPER", "1") != "0"
         self._whisper_model = None  # lazy-loaded on first use
+        self._configure_ffmpeg_path()
+
+    def _configure_ffmpeg_path(self):
+        """Make FFmpeg discoverable for pydub, especially on fresh WinGet installs."""
+        if os.name != "nt":
+            return
+        ffmpeg_link = os.path.join(
+            os.environ.get("LOCALAPPDATA", ""),
+            "Microsoft",
+            "WinGet",
+            "Links",
+            "ffmpeg.exe",
+        )
+        ffprobe_link = os.path.join(
+            os.environ.get("LOCALAPPDATA", ""),
+            "Microsoft",
+            "WinGet",
+            "Links",
+            "ffprobe.exe",
+        )
+        if os.path.exists(ffmpeg_link):
+            AudioSegment.converter = ffmpeg_link
+            ffmpeg_dir = os.path.dirname(ffmpeg_link)
+            if ffmpeg_dir and ffmpeg_dir not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+        if os.path.exists(ffprobe_link):
+            AudioSegment.ffprobe = ffprobe_link
         
     def extract_video_id(self, url):
         """Extract YouTube video ID from URL"""
@@ -48,7 +92,18 @@ class WorkingYouTubeToText:
 
         # Use absolute path inside output dir to avoid Windows fragment path issues
         abs_output_path = os.path.join(os.path.abspath(self.output_dir), "audio_download")
-        
+
+        # Remove any leftover download from a previous (possibly interrupted) run.
+        # The download target is a FIXED filename, and with nopart=True yt-dlp
+        # range-requests against an existing file — a stale one makes the server
+        # return HTTP 416 and every download fails. Clearing it keeps the batch
+        # self-healing after a crash/kill mid-download.
+        for stale in glob.glob(abs_output_path + "*"):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+
         ydl_opts = {
             'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
             'outtmpl': abs_output_path,
@@ -82,6 +137,50 @@ class WorkingYouTubeToText:
             return self.whisper_compute_type
         return "float16" if device == "cuda" else "int8"
 
+    def _setup_windows_cuda_dlls(self):
+        """On Windows, add CUDA DLL folders from pip-installed NVIDIA packages.
+        This avoids `cublas64_12.dll not found` when using faster-whisper on GPU.
+        """
+        if os.name != "nt":
+            return
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        site_packages = os.path.join(project_root, ".venv", "Lib", "site-packages")
+        if not os.path.isdir(site_packages):
+            # Fall back to whatever venv is actually active (if any).
+            site_packages = next(
+                (p for p in sys.path if os.path.isdir(p) and os.path.basename(p) == "site-packages"),
+                None,
+            )
+        if not site_packages or not os.path.isdir(site_packages):
+            return
+
+        patterns = [
+            os.path.join(site_packages, "nvidia", "cublas", "bin"),
+            os.path.join(site_packages, "nvidia", "cudnn", "bin"),
+            os.path.join(site_packages, "nvidia", "cuda_runtime", "bin"),
+        ]
+
+        found = [p for p in patterns if os.path.isdir(p)]
+
+        # Fallback for slight layout variations in nvidia wheel packages.
+        for dll in glob.glob(os.path.join(site_packages, "nvidia", "**", "cublas64_12.dll"), recursive=True):
+            d = os.path.dirname(dll)
+            if d not in found:
+                found.append(d)
+
+        for p in found:
+            try:
+                os.add_dll_directory(p)
+            except Exception:
+                pass
+
+        # ctranslate2 loads cuBLAS/cuDNN via plain LoadLibrary, which only honors
+        # PATH (not os.add_dll_directory's search list) — so PATH must be set too.
+        current_path = os.environ.get("PATH", "")
+        missing = [p for p in found if p not in current_path]
+        if missing:
+            os.environ["PATH"] = os.pathsep.join(missing) + os.pathsep + current_path
+
     def _load_whisper(self):
         """Lazy-load the faster-whisper model. Returns the model or None if
         unavailable (caller then falls back to Google)."""
@@ -90,6 +189,7 @@ class WorkingYouTubeToText:
         if self._whisper_model is not None:
             return self._whisper_model
         try:
+            self._setup_windows_cuda_dlls()
             from faster_whisper import WhisperModel
             device = self.whisper_device
             if device == "auto":
@@ -392,6 +492,13 @@ class WorkingYouTubeToText:
             safe = (fallback or "output")
         # Final cleanup and ensure not empty
         safe = re.sub(r'\s+', '_', safe).strip('_') or "output"
+        # Guarantee uniqueness: titles are truncated to max_length, so different
+        # videos with the same leading words (e.g. "پرسش و پاسخ جامع فصل اول تا
+        # سیزدهم/نوزدهم/هفتم") would otherwise collide — causing one to be
+        # wrongly skipped as "already done" or to overwrite another. Appending
+        # the video id makes every video's basename unique.
+        if fallback and fallback not in safe:
+            safe = f"{safe}_{fallback}"
         return safe
 
     def _trim_wav(self, wav_path: str, max_minutes: int) -> str:

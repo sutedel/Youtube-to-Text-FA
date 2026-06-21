@@ -119,6 +119,19 @@ _RAW_CORRECTIONS = [
 
     # --- Spacing for ATR family ----------------------------------------------
     (_word(r"ای\s*تی\s*آر"), "ای تی آر"),
+
+    # --- High-frequency mis-hearings found in the full-batch polish pass ------
+    # «لگ» (leg) consistently mis-heard as «لیگ» (league); never valid here.
+    # Left boundary only, so suffixed forms (لیگ‌ها، لیگی، لیگمون) are fixed too.
+    (r"(?<![" + _FA + r"])لیگ", "لگ"),
+    # «می‌اندازید/می‌اندازیم» clipped to «می‌دازید/میدازید/...»; the clipped form
+    # is not a real Persian word. No boundaries so the negative «نمی‌دازید» (the
+    # «نمی» prefix is left intact) and suffixed forms are handled as well.
+    (r"می[‌\s]?دازید", "می‌اندازید"),
+    (r"می[‌\s]?دازیم", "می‌اندازیم"),
+    (_word(r"نانگزاری"), "نام‌گذاری"),
+    # «ظهر به وقت ایران» mis-heard as «زور به وقت ایران».
+    (r"زور(?=\s+به\s+وقت)", "ظهر"),
 ]
 
 _CORRECTIONS = [(re.compile(p), r) for p, r in _RAW_CORRECTIONS]
