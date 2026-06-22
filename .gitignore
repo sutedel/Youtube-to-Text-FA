@@ -17,3 +17,17 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Local automation artifacts
+.claude/
+*.prev
+*.prev2
+*.flag
+
+# Local queue helpers
+queue_next.txt
+missed_urls.txt
+
+# Keep polished transcripts trackable
+!output_polished/
+!output_polished/**/*.txt
+
