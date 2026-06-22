@@ -1,0 +1,23 @@
+#!/bin/bash
+# Waits for the main batch (transcribe_all.py urls.txt) to finish, then runs the
+# queued list (queue_next.txt): the 2 missed videos + the second playlist.
+cd "c:/forex/texttrex/Youtube-to-Text-FA" || exit 1
+
+ps_check='Get-CimInstance Win32_Process -Filter "Name='"'"'python.exe'"'"'" | Where-Object { $_.CommandLine -like "*transcribe_all.py urls.txt*" } | Measure-Object | Select-Object -ExpandProperty Count'
+
+echo "[watcher] $(date) — waiting for main batch (urls.txt) to finish..." >> queue_watcher.log
+while true; do
+  n=$(powershell.exe -NoProfile -Command "$ps_check" 2>/dev/null | tr -d '[:space:]')
+  if [ "$n" = "0" ] || [ -z "$n" ]; then
+    break
+  fi
+  sleep 60
+done
+
+echo "[watcher] $(date) — main batch done. Starting queued list (queue_next.txt)..." >> queue_watcher.log
+export WHISPER_MODEL=large-v3
+export WHISPER_DEVICE=auto
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+./.venv/Scripts/python.exe -u transcribe_all.py queue_next.txt >> batch_run_2.log 2>&1
+echo "[watcher] $(date) — queued list finished." >> queue_watcher.log
